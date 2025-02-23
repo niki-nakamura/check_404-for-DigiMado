@@ -71,10 +71,9 @@ def get_all_urls_from_sitemaps(url):
     root = fetch_sitemap(url)
     if root is None:
         return all_urls
-    # サブサイトマップがあるかどうか
+
     subs = extract_sitemap_urls(root)
     if subs:
-        # サブサイトマップを辿る
         for sub in subs:
             sub_root = fetch_sitemap(sub)
             deeper_subs = extract_sitemap_urls(sub_root)
@@ -85,58 +84,60 @@ def get_all_urls_from_sitemaps(url):
             else:
                 all_urls.extend(extract_page_urls(sub_root))
     else:
-        # サブサイトマップの無い場合は直接URLリストを取り出す
         all_urls.extend(extract_page_urls(root))
 
     # 重複排除
     all_urls = list(set(all_urls))
     return all_urls
 
-def find_internal_links_in_page(page_url):
+def find_all_links_in_page(page_url):
     """
-    指定ページのHTMLを取得し、同ドメイン内（https://digi-mado.jp）へのリンクを全て返す。
+    指定ページのHTMLを取得し、<a href="..."> の全リンクを返す（ドメイン制限なし）。
     """
     links = []
     try:
         resp = requests.get(page_url, timeout=10)
         if resp.status_code != 200:
-            # そもそもページ自体が404などの場合はリンク取得不可
+            # ページ自体が200でなければリンクは解析しない
             return links
         soup = BeautifulSoup(resp.text, "html.parser")
-        # 全ての <a href="..."> を取得
         for a in soup.find_all("a", href=True):
-            href = a["href"]
-            # 絶対URLに変換
-            full_url = urljoin(page_url, href)
-            # 同一ドメインのみ対象
-            if same_domain(full_url, BASE_URL):
-                links.append(full_url)
+            full_url = urljoin(page_url, a["href"])
+            links.append(full_url)
     except Exception as e:
-        print(f"[Warning] find_internal_links_in_page({page_url}): {e}")
+        print(f"[Warning] find_all_links_in_page({page_url}): {e}")
     return links
 
-def same_domain(url, base):
+def check_page_and_links_404(page_url):
     """
-    URLが baseドメイン と同じか確認する。
-    """
-    parsed = urlparse(url)
-    base_parsed = urlparse(base)
-    return parsed.netloc == base_parsed.netloc
-
-def check_internal_links_404(page_url):
-    """
-    ページ内リンクを全てチェックし、404のリンクがあれば [(リンク先, page_url)] で返す。
+    1) ページ自体が404なら [(page_url, "SELF")] を返す。
+    2) ページが200の場合のみ、ページ内リンクをHEADリクエストし、
+       404なら [(リンク先, page_url)] にまとめて返す。
     """
     not_found_list = []
-    links = find_internal_links_in_page(page_url)
+
+    # まずページ自体のステータスを確認
+    try:
+        r_page = requests.head(page_url, timeout=10)
+        if r_page.status_code == 404:
+            # 記事ページ自体が404
+            not_found_list.append((page_url, "SELF"))
+            return not_found_list  # そもそも本文は取得できないのでリンクチェック終了
+    except Exception as e:
+        print(f"[Warning] check_page_and_links_404() -> HEAD {page_url} error: {e}")
+        # 通信エラー等の場合はリンクチェックせずスキップ
+        return not_found_list
+
+    # ページが200の場合のみ、内部/外部リンクを全て拾って404確認
+    links = find_all_links_in_page(page_url)
     for link in links:
         try:
-            r = requests.head(link, timeout=10)
-            # GETではなくHEADを使うと多少高速化
-            if r.status_code == 404:
+            r_link = requests.head(link, timeout=10)
+            if r_link.status_code == 404:
                 not_found_list.append((link, page_url))
         except Exception as e:
-            print(f"[Warning] check_internal_links_404: {link} -> {e}")
+            print(f"[Warning] check_page_and_links_404: link={link}, error={e}")
+
     return not_found_list
 
 def load_not_found_data():
@@ -148,7 +149,6 @@ def load_not_found_data():
         with open(NOT_FOUND_JSON_PATH, "r", encoding="utf-8") as f:
             return json.load(f)
     else:
-        # ファイルが無ければ空の構造を返す
         return {"data": []}
 
 def save_not_found_data(data):
@@ -182,9 +182,7 @@ def update_not_found_list(new_404_list):
                 "parent": parent,
                 "status": "open",  # 新規検知時は open 状態にする
             }
-        else:
-            # 既存の場合はstatusをそのままにする
-            pass
+        # 既存の場合、statusをそのまま残す
 
     # 結果を保存形式に戻す
     merged_data = {"data": list(record_dict.values())}
@@ -215,37 +213,38 @@ def send_teams_notification(message):
 def main():
     print("[Info] Starting 404 check ...")
 
-    # 1) サイトマップから「全ページURL一覧」を取得
+    # 1) サイトマップから全URLを取得
     all_pages = get_all_urls_from_sitemaps(MAIN_SITEMAP_URL)
-    print(f"[Info] Found {len(all_pages)} pages from sitemap(s).")
+    print(f"[Info] Found {len(all_pages)} pages from sitemaps in total.")
 
-    # 2) 各ページの内部リンクをチェックし、404の (リンク先, 検知元) を集める
+    # 2) 「https://digi-mado.jp/article/」 で始まるものだけを対象にする
+    article_pages = [url for url in all_pages if url.startswith("https://digi-mado.jp/article/")]
+    print(f"[Info] Filtered down to {len(article_pages)} article pages.")
+
     new_404_list = []
-    for page_url in all_pages:
-        # ページ内にあるリンクの404をチェック
-        _404s = check_internal_links_404(page_url)
+    # 3) 各記事ページ自体の404と、記事ページ内リンクの404を検出
+    for page_url in article_pages:
+        _404s = check_page_and_links_404(page_url)
         if _404s:
             new_404_list.extend(_404s)
 
+    # 4) 新規に見つかった404が無ければ通知の上で終了
     if not new_404_list:
-        # 新規に見つかった404が無い場合
         msg = "【404チェック結果】新規に検出された404はありません。"
         print(msg)
         send_teams_notification(msg)
+        print("[Info] Done.")
         return
 
-    # 3) 既存の 404データ と突き合わせ、JSONを上書き
+    # 5) 既存の 404データとマージして保存
     merged_data = update_not_found_list(new_404_list)
 
-    # 4) Teams通知用メッセージを作成
-    # 新たに検出された404だけを通知したい場合は new_404_list のみ書く、
-    # 全404をまとめて通知したいなら merged_data["data"] でもOK。
+    # 6) 新しく検出された404のリストを Teams に通知
     lines = []
-    for url, parent in new_404_list:
+    for (url, parent) in new_404_list:
         lines.append(f"- {url} (from: {parent})")
     msg = "【404チェック結果】\n以下のリンクが新たに404と判定されました:\n" + "\n".join(lines)
 
-    # 5) Teamsへ通知
     print("[Info] Sending Teams notification...")
     send_teams_notification(msg)
     print("[Info] Done.")
