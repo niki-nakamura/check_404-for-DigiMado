@@ -37,7 +37,10 @@ else:
         with col1:
             st.markdown(f"**URL**: {rec['url']}")
         with col2:
-            st.write(f"From: {rec['parent']}")
+            if rec["parent"] == "SELF":
+                st.write("From: (article page itself)")
+            else:
+                st.write(f"From: {rec['parent']}")
         with col3:
             # Status のセレクトボックス例
             new_status = st.selectbox(
