@@ -1,46 +1,68 @@
 import streamlit as st
-import requests
+import json
 import os
-from scripts.check_404 import (
-    get_all_urls_from_sitemaps,
-    check_404_urls,
-    send_teams_notification,
-    MAIN_SITEMAP_URL
+from check_404 import (
+    NOT_FOUND_JSON_PATH,
+    update_not_found_list,
+    load_not_found_data,
+    main as run_check_404
 )
 
 st.title("404 Check Dashboard")
 
-if "last_result" not in st.session_state:
-    st.session_state["last_result"] = []
+# -------------- JSONデータの読み込み --------------
+data = load_not_found_data()
+records = data["data"]  # [{ "url": ..., "parent": ..., "status": ... }, ...]
 
-TEAMS_WEBHOOK_URL = os.environ.get("TEAMS_WEBHOOK_URL")
-if not TEAMS_WEBHOOK_URL:
-    st.warning("環境変数 TEAMS_WEBHOOK_URL が設定されていません。Teams通知ができません。")
+if "records_state" not in st.session_state:
+    # セッションステートにロード
+    st.session_state["records_state"] = records
 
-if st.button("Run 404 Check"):
-    with st.spinner("Checking..."):
-        all_urls = get_all_urls_from_sitemaps(MAIN_SITEMAP_URL)
-        not_found_urls = check_404_urls(all_urls)
-        if not not_found_urls:
-            message = "【404チェック結果】\n404は検出されませんでした。"
-        else:
-            message = "【404チェック結果】\n以下のURLが404でした:\n" + "\n".join(not_found_urls)
+def save_state_to_json():
+    """セッションステート内のレコードをJSONに反映"""
+    new_data = {"data": st.session_state["records_state"]}
+    with open(NOT_FOUND_JSON_PATH, "w", encoding="utf-8") as f:
+        json.dump(new_data, f, ensure_ascii=False, indent=2)
 
-        # 結果をStreamlitに表示
-        st.session_state["last_result"] = not_found_urls
-        if not_found_urls:
-            st.error(f"{len(not_found_urls)}件の404を検出")
-        else:
-            st.success("404は検出されませんでした")
-
-        # Teams通知
-        if TEAMS_WEBHOOK_URL:
-            send_teams_notification(message)
-
-st.subheader("Last Check Result")
-if st.session_state["last_result"]:
-    st.write("以下のURLが404でした:")
-    for url in st.session_state["last_result"]:
-        st.write(url)
+# -------------- 404リスト表示＆ステータス管理 --------------
+st.subheader("Detected 404 Links")
+if len(st.session_state["records_state"]) == 0:
+    st.write("現在404は検出されていません。")
 else:
-    st.write("まだチェックを実行していません。")
+    # テーブル表示する
+    # 各行に対してステータスを選択できるようにする例
+    updated_records = []
+    for i, rec in enumerate(st.session_state["records_state"]):
+        col1, col2, col3, col4 = st.columns([3,3,2,2])
+        with col1:
+            st.markdown(f"**URL**: {rec['url']}")
+        with col2:
+            st.write(f"From: {rec['parent']}")
+        with col3:
+            # Status のセレクトボックス例
+            new_status = st.selectbox(
+                label="Status",
+                options=["open", "fixed", "ignore"],
+                index=["open","fixed","ignore"].index(rec["status"]),
+                key=f"select_{i}"
+            )
+            rec["status"] = new_status
+        with col4:
+            st.write("")  # スペーサ
+
+        updated_records.append(rec)
+
+    st.session_state["records_state"] = updated_records
+
+    if st.button("Save Changes"):
+        save_state_to_json()
+        st.success("ステータスを保存しました。")
+
+# -------------- 手動で再チェックボタン --------------
+st.subheader("Run 404 Check Manually")
+if st.button("Run 404 Check Now"):
+    st.info("Checking... This may take a while.")
+    run_check_404()
+    # 再実行後にJSONを再読み込み
+    st.session_state["records_state"] = load_not_found_data()["data"]
+    st.success("再チェック完了しました。更新した404リストを反映しています。")
